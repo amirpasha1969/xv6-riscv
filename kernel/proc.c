@@ -125,6 +125,13 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  p->queue = DEF_QUEUE;    // new procs start in FCFS queue
+  p->queue_enter = ticks;
+  p->wait_time = 0;
+  p->burst = DEF_BURST;
+  p->confidence = DEF_CONFIDENCE;
+  p->quantum_ticks = 0;
+
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     freeproc(p);
@@ -221,6 +228,7 @@ userinit(void)
   struct proc *p;
 
   p = allocproc();
+    p->queue = 1;
   initproc = p;
 
   p->cwd = namei("/");
@@ -288,6 +296,8 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+    if (p == initproc)            // init's children are shells -> queue 1
+    np->queue = 1;
 
   pid = np->pid;
 
@@ -417,7 +427,119 @@ kwait(uint64 addr)
     acquire(&wait_lock);
   }
 }
+#if defined(SCHED_MLFQ)
 
+static int rr_last = NPROC - 1;   // index of the last proc run from queue 1
+
+// Contract: each *_pick() returns a RUNNABLE proc with p->lock HELD, or 0.
+static struct proc *
+rr_pick(void)
+{
+  struct proc *p;
+  int i, idx;
+
+  for (i = 1; i <= NPROC; i++) {
+    idx = (rr_last + i) % NPROC;
+    p = &proc[idx];
+    acquire(&p->lock);
+    if (p->state == RUNNABLE && p->queue == 1) {
+      rr_last = idx;
+      p->quantum_ticks = 0;
+      p->wait_time = 0;
+      return p;
+    }
+    release(&p->lock);
+  }
+  return 0;
+}
+
+static struct proc *sjf_pick(void)  { return 0; }   // 2.7 (A)
+static struct proc *
+fcfs_pick(void)
+{
+  struct proc *p;
+
+  for (;;) {
+    int best = -1;
+    uint best_t = 0;
+
+    // pass 1: find the proc that entered queue 3 earliest.
+    // Locks are taken one at a time, never two together (no deadlock).
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && p->queue == 3 &&
+          (best < 0 || p->queue_enter < best_t)) {
+        best = p - proc;
+        best_t = p->queue_enter;
+      }
+      release(&p->lock);
+    }
+    if (best < 0)
+      return 0;
+
+    // pass 2: lock it and re-check, since another CPU may have taken it.
+    p = &proc[best];
+    acquire(&p->lock);
+    if (p->state == RUNNABLE && p->queue == 3) {
+      p->wait_time = 0;
+      return p;
+    }
+    release(&p->lock);
+  }
+}
+
+// TEMP: lets the kernel boot until the picks above exist. Remove later.
+static struct proc *
+any_pick(void)
+{
+  struct proc *p;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE)
+      return p;
+    release(&p->lock);
+  }
+  return 0;
+}
+
+static struct proc *
+mlfq_pick(void)
+{
+  struct proc *p;
+  if ((p = rr_pick()) != 0)   return p;   // queue 1
+  if ((p = sjf_pick()) != 0)  return p;   // queue 2
+  if ((p = fcfs_pick()) != 0) return p;   // queue 3
+  return any_pick();
+}
+
+void
+scheduler(void)
+{
+  struct proc *p;
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+  for (;;) {
+    intr_on();
+    intr_off();
+
+    p = mlfq_pick();
+    if (p == 0) {
+      asm volatile("wfi");
+      continue;
+    }
+
+    p->state = RUNNING;
+    c->proc = p;
+    swtch(&c->context, &p->context);
+    mycpu()->intena = 0;
+    c->proc = 0;
+    release(&p->lock);
+  }
+}
+
+#else 
+// default RR (original xv6); CFS gets its own #elif later (A)
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -468,6 +590,7 @@ scheduler(void)
     }
   }
 }
+#endif
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
@@ -496,6 +619,50 @@ sched(void)
   mycpu()->intena = intena;
 }
 
+// Called on every timer interrupt taken while a process is running.
+// Returns 1 if the running process should give up the CPU now.
+int
+sched_tick(void)
+{
+#if defined(SCHED_MLFQ)
+  struct proc *p = myproc();
+  int ret = 0;
+
+  acquire(&p->lock);
+  if (p->queue == 1) {                       // RR: yield when quantum ends
+    p->quantum_ticks++;
+    if (p->quantum_ticks >= RR_QUANTUM)
+      ret = 1;
+  } else if (p->queue == 2) {                // SJF: re-decide every tick (see note)
+    ret = 1;
+  }                                          // queue 3 (FCFS): never preempted
+  release(&p->lock);
+  return ret;
+#else
+  return 1;                                  // RR/CFS: original behaviour
+#endif
+}
+// Called once per tick, from CPU 0 only (so aging is not counted twice).
+void
+aging_tick(void)
+{
+#if defined(SCHED_MLFQ)
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE && p->queue > 1) {
+      p->wait_time++;
+      if (p->wait_time >= AGING_LIMIT) {
+        p->queue--;                // promote one level
+        p->wait_time = 0;
+        p->queue_enter = ticks;
+      }
+    }
+    release(&p->lock);
+  }
+#endif
+}
 // Give up the CPU for one scheduling round.
 void
 yield(void)
@@ -588,6 +755,8 @@ wakeup(void *chan)
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
+        p->queue_enter = ticks;   // re-entered the ready queue now (for FCFS)
+        p->wait_time = 0;         // start counting aging from zero
       }
     }
     release(&p->lock);
@@ -697,7 +866,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printk("%d %s %s", p->pid, state, p->name);
+          printk("%d %s %s q=%d w=%d", p->pid, state, p->name, p->queue, p->wait_time);
     printk("\n");
   }
 }

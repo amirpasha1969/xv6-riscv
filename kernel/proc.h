@@ -88,6 +88,13 @@ struct proc {
   int killed;           // If non-zero, have been killed
   int xstate;           // Exit status to be returned to parent's wait
   int pid;              // Process ID
+    // MLFQ fields (p->lock must be held)
+  int queue;            // 1 = RR, 2 = SJF, 3 = FCFS
+  uint queue_enter;     // tick when proc entered its current queue (for FCFS)
+  uint wait_time;       // ticks spent RUNNABLE without getting the CPU (aging)
+  int burst;            // SJF: suggested burst time
+  int confidence;       // SJF: confidence level, 0..100
+  int quantum_ticks;    // RR: ticks used in the current quantum
 
   // wait_lock must be held when using this:
   struct proc *parent; // Parent process
