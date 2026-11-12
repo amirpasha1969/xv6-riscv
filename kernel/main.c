@@ -17,6 +17,16 @@ main()
     printk("xv6 kernel is booting\n");
     printk("\n");
     kinit();            // physical page allocator
+    printk("\n");
+    printk("xv6 kernel is booting\n");
+#if defined(SCHED_MLFQ)
+    printk("scheduler: MLFQ\n");
+#elif defined(SCHED_CFS)
+    printk("scheduler: CFS\n");
+#else
+    printk("scheduler: RR\n");
+#endif
+    printk("\n");
     kvminit();          // create kernel page table
     kvminithart();      // turn on paging
     procinit();         // process table
