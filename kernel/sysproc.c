@@ -34,6 +34,17 @@ sys_getprocs(void)
 }
 
 uint64
+sys_setsched(void)
+{
+  int pid, burst, confidence;
+
+  argint(0, &pid);
+  argint(1, &burst);
+  argint(2, &confidence);
+  return setsched(pid, burst, confidence);
+}
+
+uint64
 sys_fork(void)
 {
   return kfork();

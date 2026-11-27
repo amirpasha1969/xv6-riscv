@@ -20,13 +20,15 @@ main(void)
     exit(1);
   }
 
-  printf("PID\tPPID\tSTATE\t\tSIZE\tNAME\n");
+  printf("PID\tPPID\tSTATE\t\tSIZE\tQ\tWAIT\tBURST\tCONF\tNAME\n");
   for(int i = 0; i < n; i++){
     char *s = "???";
     if(buf[i].state >= 0 && buf[i].state < 6)
       s = states[buf[i].state];
-    printf("%d\t%d\t%s\t%d\t%s\n",
-           buf[i].pid, buf[i].ppid, s, (int)buf[i].sz, buf[i].name);
+    printf("%d\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\n",
+           buf[i].pid, buf[i].ppid, s, (int)buf[i].sz,
+           buf[i].queue, buf[i].wait_time, buf[i].burst,
+           buf[i].confidence, buf[i].name);
   }
   exit(0);
 }

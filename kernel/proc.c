@@ -26,7 +26,30 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+#if defined(SCHED_MLFQ)
+// Linear Congruential Generator: x(n+1) = (a * x(n) + c) mod 2^32
+// Numerical Recipes constants. Hull-Dobell theorem: c is odd and a-1 is
+// divisible by 4, so the period is the full 2^32.
+// Low bits of a power-of-two LCG are weak (bit 0 alternates), so we
+// use the high 16 bits.
+#define LCG_A 1664525u
+#define LCG_C 1013904223u
+static struct spinlock rand_lock;
+static uint lcg_state = 12345;
 
+// Returns a number in [0, 99].
+static int
+rand100(void)
+{
+  uint x;
+
+  acquire(&rand_lock);
+  lcg_state = lcg_state * LCG_A + LCG_C;   // uint arithmetic wraps mod 2^32
+  x = lcg_state;
+  release(&rand_lock);
+  return (x >> 16) % 100;
+}
+#endif
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -52,6 +75,9 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  #if defined(SCHED_MLFQ)
+  initlock(&rand_lock, "rand");
+  #endif
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -454,7 +480,54 @@ rr_pick(void)
   return 0;
 }
 
-static struct proc *sjf_pick(void)  { return 0; }   // 2.7 (A)
+// Probabilistic SJF over queue 2. Returns a RUNNABLE proc with p->lock held, or 0.
+static struct proc *
+sjf_pick(void)
+{
+  int idx[NPROC], burst[NPROC], conf[NPROC];
+  struct proc *p;
+  int n, i, j;
+
+  for (;;) {
+    n = 0;
+    // pass 1: snapshot candidates, one lock at a time (never two together)
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && p->queue == 2) {
+        idx[n] = p - proc;
+        burst[n] = p->burst;
+        conf[n] = p->confidence;
+        n++;
+      }
+      release(&p->lock);
+    }
+    if (n == 0)
+      return 0;
+
+    // insertion sort by burst, ascending (ties keep table order)
+    for (i = 1; i < n; i++) {
+      int ki = idx[i], kb = burst[i], kc = conf[i];
+      for (j = i - 1; j >= 0 && burst[j] > kb; j--) {
+        idx[j+1] = idx[j]; burst[j+1] = burst[j]; conf[j+1] = conf[j];
+      }
+      idx[j+1] = ki; burst[j+1] = kb; conf[j+1] = kc;
+    }
+
+    // pass 2: walk in SJF order; the last one runs regardless of confidence
+    for (i = 0; i < n; i++) {
+      if (i != n - 1 && rand100() > conf[i])
+        continue;
+      p = &proc[idx[i]];
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && p->queue == 2) {
+        p->wait_time = 0;
+        return p;
+      }
+      release(&p->lock);          // another CPU took it; try the next one
+    }
+    // every candidate vanished: take a fresh snapshot
+  }
+}
 static struct proc *
 fcfs_pick(void)
 {
@@ -489,28 +562,13 @@ fcfs_pick(void)
   }
 }
 
-// TEMP: lets the kernel boot until the picks above exist. Remove later.
-static struct proc *
-any_pick(void)
-{
-  struct proc *p;
-  for (p = proc; p < &proc[NPROC]; p++) {
-    acquire(&p->lock);
-    if (p->state == RUNNABLE)
-      return p;
-    release(&p->lock);
-  }
-  return 0;
-}
-
 static struct proc *
 mlfq_pick(void)
 {
   struct proc *p;
   if ((p = rr_pick()) != 0)   return p;   // queue 1
   if ((p = sjf_pick()) != 0)  return p;   // queue 2
-  if ((p = fcfs_pick()) != 0) return p;   // queue 3
-  return any_pick();
+  return fcfs_pick();                     // queue 3
 }
 
 void
@@ -782,6 +840,8 @@ kkill(int pid)
       if (p->state == SLEEPING) {
         // Wake process from sleep().
         p->state = RUNNABLE;
+        p->queue_enter = ticks;
+        p->wait_time = 0;
       }
       release(&p->lock);
       return 0;
@@ -898,6 +958,10 @@ getprocs(uint64 addr, int max)
       tmp[n].state = p->state;
       tmp[n].sz = p->sz;
       safestrcpy(tmp[n].name, p->name, sizeof(tmp[n].name));
+      tmp[n].queue = p->queue;
+      tmp[n].wait_time = p->wait_time;
+      tmp[n].burst = p->burst;
+      tmp[n].confidence = p->confidence;
       n++;
     }
     release(&p->lock);
@@ -911,4 +975,24 @@ getprocs(uint64 addr, int max)
   }
   kfree(tmp);
   return n;
+}
+// Set SJF burst and confidence of process pid. Returns 0, or -1 on error.
+int
+setsched(int pid, int burst, int confidence)
+{
+  struct proc *p;
+
+  if(burst < 1 || confidence < 0 || confidence > 100)
+    return -1;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state != UNUSED && p->pid == pid){
+      p->burst = burst;
+      p->confidence = confidence;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
 }

@@ -171,13 +171,7 @@ clockintr()
     ticks++;
     wakeup(&ticks);
     release(&tickslock);
-    if (cpuid() == 0) {
-    acquire(&tickslock);
-    ticks++;
-    wakeup(&ticks);
-    release(&tickslock);
     aging_tick();
-  }
   }
 
   // ask for the next timer interrupt. this also clears
