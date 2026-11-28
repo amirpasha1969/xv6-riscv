@@ -692,7 +692,7 @@ sched_tick(void)
     p->quantum_ticks++;
     if (p->quantum_ticks >= RR_QUANTUM)
       ret = 1;
-  } else if (p->queue == 2) {                // SJF: re-decide every tick (see note)
+  } else if (p->queue == 2) {                // SJF: re-decide every tick
     ret = 1;
   }                                          // queue 3 (FCFS): never preempted
   release(&p->lock);

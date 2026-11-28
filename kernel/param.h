@@ -17,4 +17,4 @@
 #define AGING_LIMIT     800   // ticks a RUNNABLE proc may wait before promotion
 #define DEF_CONFIDENCE  50    // default SJF confidence (0..100)
 #define DEF_BURST       2     // default SJF burst time
-#define DEF_QUEUE       3     // queue of new procs (TEMP: set to 1 to test RR)
+#define DEF_QUEUE       3     // queue of new procs
