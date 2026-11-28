@@ -45,3 +45,4 @@ entry("uptime");
 entry("sync");
 entry("getprocs");
 entry("setsched");
+entry("setnice");

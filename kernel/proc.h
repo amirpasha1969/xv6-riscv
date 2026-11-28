@@ -96,6 +96,10 @@ struct proc {
   int confidence;       // SJF: confidence level, 0..100
   int quantum_ticks;    // RR: ticks used in the current quantum
 
+  // CFS fields (p->lock must be held)
+  int nice;             // -20..19 (default 0)
+  uint weight;          // weight corresponding to nice (default 1024)
+  uint64 vruntime;      // scaled virtual runtime (multiplied by CFS_SCALE)
   // wait_lock must be held when using this:
   struct proc *parent; // Parent process
 

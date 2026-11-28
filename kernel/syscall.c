@@ -105,6 +105,7 @@ extern uint64 sys_close(void);
 extern uint64 sys_sync(void);
 extern uint64 sys_getprocs(void);
 extern uint64 sys_setsched(void);
+extern uint64 sys_setnice(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -134,6 +135,7 @@ static uint64 (*syscalls[])(void) = {
   [SYS_sync]    = sys_sync,
   [SYS_getprocs] sys_getprocs,
   [SYS_setsched] sys_setsched,
+  [SYS_setnice] = sys_setnice,
   
   // clang-format on
 };

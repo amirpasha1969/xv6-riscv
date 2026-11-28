@@ -28,6 +28,7 @@ int uptime(void);
 int sync(void);
 int getprocs(struct pinfo*, int);
 int setsched(int, int, int);
+int setnice(int pid, int nice);
 
 // ulib.c
 int stat(const char *, struct stat *);

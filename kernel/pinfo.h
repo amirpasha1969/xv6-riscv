@@ -11,6 +11,8 @@ struct pinfo {
   int wait_time;
   int burst;
   int confidence;
+  int nice;
+  unsigned long vruntime;
 };
 
 #endif

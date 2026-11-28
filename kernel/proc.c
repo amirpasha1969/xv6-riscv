@@ -26,6 +26,37 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+#define CFS_NICE_MIN (-20)
+#define CFS_NICE_MAX 19
+#define CFS_SCALE 1000ULL
+#define CFS_BASE_WEIGHT 1024U
+#define CFS_LATENCY 12U      // L = 12 ticks
+#define CFS_MIN_GRAN 2U      // min_gran = 2 ticks
+
+// Weight table for nice in [-20, 19], anchored at nice=0 -> 1024,
+// scaling by ~1.25x per step toward negative nice (higher priority).
+static const uint cfs_prio_to_weight[40] = {
+ /* -20 */ 88761, 71755, 56483, 46273, 36291,
+ /* -15 */ 29154, 23254, 18705, 14949, 11916,
+ /* -10 */  9548,  7620,  6100,  4904,  3906,
+ /*  -5 */  3121,  2501,  1991,  1586,  1277,
+ /*   0 */  1024,   820,   655,   526,   423,
+ /*   5 */   335,   272,   215,   172,   137,
+ /*  10 */   110,    87,    70,    56,    45,
+ /*  15 */    36,    29,    23,    18,    15,
+};
+
+static uint
+nice_to_weight(int nice)
+{
+  if (nice < CFS_NICE_MIN)
+    nice = CFS_NICE_MIN;
+  if (nice > CFS_NICE_MAX)
+    nice = CFS_NICE_MAX;
+  return cfs_prio_to_weight[nice - CFS_NICE_MIN];
+}
+
 #if defined(SCHED_MLFQ)
 // Linear Congruential Generator: x(n+1) = (a * x(n) + c) mod 2^32
 // Numerical Recipes constants. Hull-Dobell theorem: c is odd and a-1 is
@@ -50,6 +81,54 @@ rand100(void)
   return (x >> 16) % 100;
 }
 #endif
+
+#if defined(SCHED_CFS)
+// Minimum vruntime among RUNNABLE or RUNNING processes.
+// If `skip` is non-NULL, caller already holds `skip->lock` so we do not
+// re-acquire it (avoiding panic: acquire).
+static uint64
+cfs_min_vruntime(struct proc *skip)
+{
+  struct proc *p;
+  int found = 0;
+  uint64 min_vr = 0;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    if (p == skip) {
+      if (p->state == RUNNABLE || p->state == RUNNING) {
+        if (!found || p->vruntime < min_vr) {
+          min_vr = p->vruntime;
+          found = 1;
+        }
+      }
+      continue;
+    }
+    acquire(&p->lock);
+    if (p->state == RUNNABLE || p->state == RUNNING) {
+      if (!found || p->vruntime < min_vr) {
+        min_vr = p->vruntime;
+        found = 1;
+      }
+    }
+    release(&p->lock);
+  }
+  return found ? min_vr : 0;
+}
+
+// Set vruntime for a new process or normalize when waking from sleep.
+// Caller must hold p->lock, and must NOT hold any other p->lock.
+static void
+cfs_place_proc(struct proc *p, int is_new)
+{
+  uint64 min_vr = cfs_min_vruntime(p);
+  if (is_new) {
+    p->vruntime = min_vr;
+  } else if (p->vruntime < min_vr) {
+    p->vruntime = min_vr;
+  }
+}
+#endif
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -75,9 +154,9 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
-  #if defined(SCHED_MLFQ)
+#if defined(SCHED_MLFQ)
   initlock(&rand_lock, "rand");
-  #endif
+#endif
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -152,12 +231,21 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+#if defined(SCHED_MLFQ)
   p->queue = DEF_QUEUE;    // new procs start in FCFS queue
   p->queue_enter = ticks;
   p->wait_time = 0;
   p->burst = DEF_BURST;
   p->confidence = DEF_CONFIDENCE;
   p->quantum_ticks = 0;
+#endif
+
+  p->nice = 0;
+  p->weight = nice_to_weight(0);
+
+#if defined(SCHED_CFS)
+  p->vruntime = 0;
+#endif
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -255,12 +343,17 @@ userinit(void)
   struct proc *p;
 
   p = allocproc();
-    p->queue = 1;
+#if defined(SCHED_MLFQ)
+  p->queue = 1;
+#endif
   initproc = p;
 
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+#if defined(SCHED_CFS)
+  cfs_place_proc(p, 1);
+#endif
 
   release(&p->lock);
 }
@@ -323,8 +416,10 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
-    if (p == initproc)            // init's children are shells -> queue 1
+#if defined(SCHED_MLFQ)
+  if (p == initproc)            // init's children are shells -> queue 1
     np->queue = 1;
+#endif
 
   pid = np->pid;
 
@@ -336,6 +431,9 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+#if defined(SCHED_CFS)
+  cfs_place_proc(np, 1);
+#endif
   release(&np->lock);
 
   return pid;
@@ -454,6 +552,7 @@ kwait(uint64 addr)
     acquire(&wait_lock);
   }
 }
+
 #if defined(SCHED_MLFQ)
 
 static int rr_last = NPROC - 1;   // index of the last proc run from queue 1
@@ -528,6 +627,7 @@ sjf_pick(void)
     // every candidate vanished: take a fresh snapshot
   }
 }
+
 static struct proc *
 fcfs_pick(void)
 {
@@ -597,15 +697,45 @@ scheduler(void)
   }
 }
 
-#else 
-// default RR (original xv6); CFS gets its own #elif later (A)
-// Per-CPU process scheduler.
-// Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
+#elif defined(SCHED_CFS)
+
+// Pick RUNNABLE process with smallest vruntime; tie-break by smallest pid.
+// Returns with p->lock held, or 0 if none runnable.
+static struct proc *
+cfs_pick(void)
+{
+  struct proc *p;
+
+  for (;;) {
+    int best_idx = -1;
+    uint64 best_vr = 0;
+    int best_pid = 0;
+
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE) {
+        if (best_idx < 0 ||
+            p->vruntime < best_vr ||
+            (p->vruntime == best_vr && p->pid < best_pid)) {
+          best_idx = p - proc;
+          best_vr = p->vruntime;
+          best_pid = p->pid;
+        }
+      }
+      release(&p->lock);
+    }
+
+    if (best_idx < 0)
+      return 0;
+
+    p = &proc[best_idx];
+    acquire(&p->lock);
+    if (p->state == RUNNABLE)
+      return p;
+    release(&p->lock);
+  }
+}
+
 void
 scheduler(void)
 {
@@ -614,11 +744,34 @@ scheduler(void)
 
   c->proc = 0;
   for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+    intr_on();
+    intr_off();
+
+    p = cfs_pick();
+    if (p == 0) {
+      asm volatile("wfi");
+      continue;
+    }
+
+    p->state = RUNNING;
+    c->proc = p;
+    swtch(&c->context, &p->context);
+    mycpu()->intena = 0;
+    c->proc = 0;
+    release(&p->lock);
+  }
+}
+
+#else
+// default RR (original xv6)
+void
+scheduler(void)
+{
+  struct proc *p;
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+  for (;;) {
     intr_on();
     intr_off();
 
@@ -626,25 +779,17 @@ scheduler(void)
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
 
-        // Don't re-enable interrupts on release.
         mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
         c->proc = 0;
         found = 1;
       }
       release(&p->lock);
     }
     if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
   }
@@ -698,9 +843,10 @@ sched_tick(void)
   release(&p->lock);
   return ret;
 #else
-  return 1;                                  // RR/CFS: original behaviour
+  return 1;                                  // RR: original behaviour
 #endif
 }
+
 // Called once per tick, from CPU 0 only (so aging is not counted twice).
 void
 aging_tick(void)
@@ -722,6 +868,101 @@ aging_tick(void)
   }
 #endif
 }
+
+#if defined(SCHED_CFS)
+void
+cfs_tick(void)
+{
+  struct proc *p = myproc();
+  if (p == 0)
+    return;
+
+  uint my_w = CFS_BASE_WEIGHT;
+  uint64 my_vr = 0;
+  int my_pid = 0;
+
+  acquire(&p->lock);
+  if (p->state == RUNNING) {
+    uint w = p->weight ? p->weight : CFS_BASE_WEIGHT;
+    uint64 delta_vr = (1ULL * CFS_BASE_WEIGHT * CFS_SCALE) / w;
+    if (delta_vr == 0)
+      delta_vr = 1;
+    p->vruntime += delta_vr;
+  }
+  my_w = p->weight ? p->weight : CFS_BASE_WEIGHT;
+  my_vr = p->vruntime;
+  my_pid = p->pid;
+  release(&p->lock);
+
+  uint64 total_w = 0;
+  int nr_active = 0;
+  struct proc *q;
+
+  for (q = proc; q < &proc[NPROC]; q++) {
+    acquire(&q->lock);
+    if (q->state == RUNNABLE || q->state == RUNNING) {
+      total_w += (q->weight ? q->weight : CFS_BASE_WEIGHT);
+      nr_active++;
+    }
+    release(&q->lock);
+  }
+
+  if (nr_active <= 1 || total_w == 0)
+    return;
+
+  // slice_i = max(min_gran, L * w_i / sum(w_j))
+  uint64 slice_ticks = (CFS_LATENCY * (uint64)my_w) / total_w;
+  if (slice_ticks < CFS_MIN_GRAN)
+    slice_ticks = CFS_MIN_GRAN;
+
+  uint64 step_vr = (1ULL * CFS_BASE_WEIGHT * CFS_SCALE) / my_w;
+  if (step_vr == 0)
+    step_vr = 1;
+  uint64 slice_vr = slice_ticks * step_vr;
+  if (slice_vr == 0)
+    slice_vr = 1;
+
+  int should_yield = 0;
+  for (q = proc; q < &proc[NPROC]; q++) {
+    acquire(&q->lock);
+    if (q->state == RUNNABLE) {
+      if (q->vruntime < my_vr || (q->vruntime == my_vr && q->pid < my_pid)) {
+        if ((my_vr % slice_vr) < step_vr) {
+          should_yield = 1;
+        }
+      }
+    }
+    release(&q->lock);
+    if (should_yield)
+      break;
+  }
+
+  if (should_yield)
+    yield();
+}
+#endif
+
+int
+setnice(int pid, int nice)
+{
+  struct proc *p;
+
+  if (pid <= 0 || nice < CFS_NICE_MIN || nice > CFS_NICE_MAX)
+    return -1;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED && p->pid == pid) {
+      p->nice = nice;
+      p->weight = nice_to_weight(nice);
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
 // Give up the CPU for one scheduling round.
 void
 yield(void)
@@ -814,8 +1055,12 @@ wakeup(void *chan)
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
+#if defined(SCHED_MLFQ)
         p->queue_enter = ticks;   // re-entered the ready queue now (for FCFS)
         p->wait_time = 0;         // start counting aging from zero
+#elif defined(SCHED_CFS)
+        cfs_place_proc(p, 0);
+#endif
       }
     }
     release(&p->lock);
@@ -840,8 +1085,12 @@ kkill(int pid)
       if (p->state == SLEEPING) {
         // Wake process from sleep().
         p->state = RUNNABLE;
+#if defined(SCHED_MLFQ)
         p->queue_enter = ticks;
         p->wait_time = 0;
+#elif defined(SCHED_CFS)
+        cfs_place_proc(p, 0);
+#endif
       }
       release(&p->lock);
       return 0;
@@ -927,7 +1176,11 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-          printk("%d %s %s q=%d w=%d", p->pid, state, p->name, p->queue, p->wait_time);
+#if defined(SCHED_CFS)
+    printk("%d %s %s nice=%d vr=%lu", p->pid, state, p->name, p->nice, p->vruntime);
+#else
+    printk("%d %s %s q=%d w=%d", p->pid, state, p->name, p->queue, p->wait_time);
+#endif
     printk("\n");
   }
 }
@@ -958,10 +1211,15 @@ getprocs(uint64 addr, int max)
       tmp[n].state = p->state;
       tmp[n].sz = p->sz;
       safestrcpy(tmp[n].name, p->name, sizeof(tmp[n].name));
+#if defined(SCHED_MLFQ)
       tmp[n].queue = p->queue;
       tmp[n].wait_time = p->wait_time;
       tmp[n].burst = p->burst;
       tmp[n].confidence = p->confidence;
+#elif defined(SCHED_CFS)
+      tmp[n].nice = p->nice;
+      tmp[n].vruntime = p->vruntime;
+#endif
       n++;
     }
     release(&p->lock);
@@ -976,6 +1234,7 @@ getprocs(uint64 addr, int max)
   kfree(tmp);
   return n;
 }
+
 // Set SJF burst and confidence of process pid. Returns 0, or -1 on error.
 int
 setsched(int pid, int burst, int confidence)

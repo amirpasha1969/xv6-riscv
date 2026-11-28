@@ -107,6 +107,8 @@ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
 int             getprocs(uint64, int);
 int             setsched(int, int, int);
+void            cfs_tick(void);
+int             setnice(int pid, int nice);
 // swtch.S
 void            swtch(struct context*, struct context*);
 

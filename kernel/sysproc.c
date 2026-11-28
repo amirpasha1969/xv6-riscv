@@ -132,3 +132,13 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_setnice(void)
+{
+  int pid, nice;
+
+  argint(0, &pid);
+  argint(1, &nice);
+  return setnice(pid, nice);
+}
